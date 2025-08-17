@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>My Chess Variant (Phone-ready)</title>
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9.0.4/chessground.css">
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  #board { width: 92vw; max-width: 420px; height: 92vw; max-height: 420px; margin: 8px auto; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin:10px 0; }
+  button, select, input, textarea { font-size: 14px; padding:8px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  .card { border:1px solid #ddd; border-radius:8px; padding:8px; margin:6px 0; }
+  .score { text-align:center; font-weight:600; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Custom Chess Variant</h1>
+  <div class="card score" id="score">White 0 — 0 Black</div>
+  <div id="board"></div>
+
+  <div class="toolbar">
+    <button id="newStd">New standard start (no castle/EP)</button>
+    <button id="newRand">Random GM start</button>
+    <button id="undo">Undo</button>
+    <button id="toggleAI">Play vs AI (Black): OFF</button>
+    <button id="resetScore">Reset scores</button>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="fenInput" class="mono" placeholder="Paste FEN (no castling/EP fields recommended)" style="flex:1; min-width:240px;">
+      <button id="loadFEN">Load FEN</button>
+    </div>
+    <small>Tip: Start FEN with “- -” (no castling/en passant) e.g. <span class="mono">rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1</span></small>
+  </div>
+
+  <div id="status" class="card"></div>
+
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/chess.js@1.0.0/dist/chess.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chessground@9.0.4/chessground.min.js"></script>
+
+  <script>
+  // --- Rules & Helpers ---
+  const VAL = { p:1, n:3, b:3, r:5, q:9, k:0 };
+  const promoBonus = { q:8, r:4, b:2, n:2 };
+  const startFENNoCastle = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1";
+
+  // curated random positions (you can add more)
+  const curatedFENs = [
+    "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w - - 2 4",
+    "rnbqkb1r/pp1p1ppp/2p2n2/4p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w - - 2 4",
+    "r1bqkbnr/pppppppp/2n5/8/2B5/5N2/PPPPPPPP/RNBQK2R b - - 3 2",
+    "rnbqkbnr/pppp1ppp/8/4p3/3P4/8/PPP1PPPP/RNBQKBNR b - - 0 2",
+    "r1bqk1nr/pppp1ppp/2n5/2b1p3/4P3/2NP1N2/PPP2PPP/R1BQKB1R w - - 4 5"
+  ];
+
+  let chess = new Chess(startFENNoCastle);
+  let ground;
+  let whiteScore = 0, blackScore = 0;
+  let plyCount = 0;
+  let freeHitAwarded = false;
+  let aiBlackOn = false;
+  let lastBlackMove = null; // for Free Hit check context
+
+  const statusEl = document.getElementById('status');
+  const scoreEl = document.getElementById('score');
+  const btnAI = document.getElementById('toggleAI');
+
+  function updateScore() {
+    scoreEl.textContent = `White ${whiteScore} — ${blackScore} Black`;
+  }
+
+  function isCastlingFlag(f){ return f.includes('k') || f.includes('q'); }
+  function isEPFlag(f){ return f.includes('e'); }
+
+  function legalMovesFiltered(side) {
+    const moves = chess.moves({ verbose: true });
+    return moves.filter(m => {
+      if ((side && m.color !== side) || (!side && m.color !== chess.turn())) return false;
+      if (isCastlingFlag(m.flags)) return false; // no castling
+      if (isEPFlag(m.flags)) return false;       // no en passant
+      return true;
+    });
+  }
+
+  function destsMap() {
+    const dests = new Map();
+    for (const m of legalMovesFiltered()) {
+      const arr = dests.get(m.from) || new Set();
+      arr.add(m.to);
+      dests.set(m.from, arr);
+    }
+    return dests;
+  }
+
+  function algebraicToKey(a){ return a; } // chessground uses "e2" keys, same as chess.js
+
+  function refreshBoard() {
+    ground.set({ fen: chess.fen(), turnColor: chess.turn()==='w'?'white':'black', movable: {dest: destsMap()} });
+    updateScore();
+    const over = chess.isGameOver();
+    statusEl.textContent =
+      (over && chess.isCheckmate()) ? `Checkmate! ${(chess.turn()==='w'?'Black':'White')} wins instantly.` :
+      (over) ? 'Game over (draw).' :
+      `Turn: ${chess.turn()==='w'?'White':'Black'}  | Ply: ${plyCount}` + (freeHitAwarded ? '  | Free Hit was awarded' : '');
+  }
+
+  // Scoring
+  function addMovePoints(move, mover) {
+    let pts = 0;
+    if (move.captured) pts += VAL[move.captured] || 0;
+    if (move.promotion && promoBonus[move.promotion]) pts += promoBonus[move.promotion];
+    if (mover === 'w') whiteScore += pts; else blackScore += pts;
+  }
+
+  // SEE-lite on capture square after Black's 6th move
+  function seeSquareScore(board, square, side) {
+    // recursive capture race on a single square; returns net gain for 'side' to move
+    // Caution: shallow search to keep it phone-friendly
+    const MAX_NODES = 2000;
+    let nodes = 0;
+
+    function rec(b, sq, stm) {
+      if (++nodes > MAX_NODES) return 0;
+      const caps = b.moves({ verbose:true }).filter(m => m.to === sq && m.flags.includes('c'));
+      const myCaps = caps.filter(m => m.color === stm);
+      if (myCaps.length === 0) return 0;
+
+      // choose least valuable attacker to be pessimistic (classical SEE idea)
+      myCaps.sort((a,b)=> (VAL[a.piece]-VAL[b.piece]));
+      let best = -999;
+      for (const mv of myCaps) {
+        const pieceOnSq = b.get(sq);
+        const capturedVal = pieceOnSq ? VAL[pieceOnSq.type]||0 : 0;
+        b.move(mv);
+        const reply = rec(b, sq, (stm==='w'?'b':'w'));
+        const gain = capturedVal - reply;
+        b.undo();
+        if (gain > best) best = gain;
+      }
+      return best===-999 ? 0 : best;
+    }
+    return rec(board, square, side);
+  }
+
+  function squareKeyToSq(key) {
+    // chess.js uses algebraic string squares; our functions use same
+    return key;
+  }
+
+  function freeHitTriggered(lastMove) {
+    // Applies after ply 12 only, last move by Black, and it must be capture or promotion
+    if (!lastMove) return false;
+    const wasCapture = !!lastMove.captured;
+    const wasPromo   = !!lastMove.promotion;
+    if (!(wasCapture || wasPromo)) return false;
+
+    const board = chess; // already after Black's move, so White to move
+    // Case 1: White has mate-in-one now
+    const whiteMoves = board.moves({ verbose:true }).filter(m => !isCastlingFlag(m.flags) && !isEPFlag(m.flags));
+    for (const wm of whiteMoves) {
+      board.move(wm);
+      const mate = board.isCheckmate();
+      board.undo();
+      if (mate) return true;
+    }
+
+    // Case 2: Exchange on capture square favorable to White and immediate recapture exists
+    const capSq = lastMove.to; // algebraic like 'e4'
+    const canRecaptureNow = whiteMoves.some(m => m.to === capSq && m.flags.includes('c'));
+    if (canRecaptureNow) {
+      const see = seeSquareScore(board, capSq, 'w');
+      if (see > 0) return true;
+    }
+
+    // Case 3: Black promoted to queen and that queen can be captured immediately
+    if (wasPromo && lastMove.promotion === 'q') {
+      const queenCapturable = whiteMoves.some(m => m.to === lastMove.to && m.flags.includes('c'));
+      if (queenCapturable) return true;
+    }
+    return false;
+  }
+
+  // Make a move (user or AI)
+  function playMove(from, to, promotion) {
+    const options = { from, to };
+    // Handle promotion (ask user if needed)
+    const needsPromo = () => {
+      const piece = chess.get(from);
+      if (!piece || piece.type !== 'p') return false;
+      const rank = parseInt(to[1],10);
+      return (piece.color==='w' && rank===8) || (piece.color==='b' && rank===1);
+    };
+    if (needsPromo()) {
+      // simple chooser; default queen
+      const choice = promotion || prompt("Promote to (q,r,b,n)?", "q");
+      options.promotion = (choice||'q').toLowerCase();
+    }
+
+    // reject castling/en passant moves
+    const legal = legalMovesFiltered().find(m => m.from===from && m.to===to && (!m.promotion || m.promotion===options.promotion));
+    if (!legal) return false;
+
+    const move = chess.move(options);
+    if (!move) return false;
+
+    // Update counters/scores
+    plyCount++;
+    addMovePoints(move, move.color);
+    if (move.color === 'b') lastBlackMove = move;
+
+    // Free Hit check right after ply 12 (after Black’s 6th move)
+    if (plyCount === 12 && move.color === 'b' && !freeHitAwarded) {
+      if (freeHitTriggered(lastBlackMove)) {
+        freeHitAwarded = true;
+        statusEl.textContent = "Foul Capture detected on ply 12. FREE HIT awarded to White — make one extra move now.";
+      }
+    }
+
+    refreshBoard();
+
+    // If game over stop
+    if (chess.isGameOver()) return true;
+
+    // AI (Black) moves only when it's Black's turn and no Free Hit pending
+    if (aiBlackOn && chess.turn()==='b' && !(freeHitAwarded && plyCount===12)) {
+      setTimeout(aiBlackMove, 200);
+    }
+
+    return true;
+  }
+
+  // super-simple AI for Black (captures first, otherwise shallow material)
+  function aiBlackMove() {
+    const moves = legalMovesFiltered('b');
+    if (moves.length===0) return;
+
+    // 1) Prefer capture with highest gain + promo bonus
+    let best = null, bestScore = -1e9;
+    for (const m of moves) {
+      let s = 0;
+      if (m.captured) s += VAL[m.captured]||0;
+      if (m.promotion && promoBonus[m.promotion]) s += promoBonus[m.promotion];
+      // tiny positional preference: center
+      const center = ['d4','e4','d5','e5'];
+      if (center.includes(m.to)) s += 0.1;
+      if (s > bestScore) { bestScore=s; best=m; }
+    }
+    const chosen = best || moves[Math.floor(Math.random()*moves.length)];
+    chess.move(chosen);
+    plyCount++;
+    addMovePoints(chosen, 'b');
+    lastBlackMove = chosen;
+
+    if (plyCount === 12 && !freeHitAwarded) {
+      if (freeHitTriggered(lastBlackMove)) {
+        freeHitAwarded = true;
+        statusEl.textContent = "Foul Capture detected on ply 12. FREE HIT awarded to White — make one extra move now.";
+      }
+    }
+
+    refreshBoard();
+  }
+
+  // Init board UI
+  function initBoard() {
+    ground = Chessground(document.getElementById("board"), {
+      fen: chess.fen(),
+      orientation: 'white',
+      turnColor: 'white',
+      movable: {
+        free: false,
+        color: 'both',
+        dest: destsMap(),
+        events: {
+          after: (from, to) => playMove(from, to)
+        }
+      }
+    });
+    refreshBoard();
+  }
+
+  // Buttons
+  document.getElementById('newStd').onclick = () => {
+    chess = new Chess(startFENNoCastle);
+    whiteScore = blackScore = 0; plyCount = 0; freeHitAwarded = false; lastBlackMove = null;
+    initBoard();
+  };
+
+  document.getElementById('newRand').onclick = () => {
+    const fen = curatedFENs[Math.floor(Math.random()*curatedFENs.length)];
+    chess = new Chess(fen.replace(/ [KQkq]+ /,' - ').replace(/ [a-h][36] /,' - ')); // scrub castle/ep if present
+    whiteScore = blackScore = 0; plyCount = 0; freeHitAwarded = false; lastBlackMove = null;
+    initBoard();
+  };
+
+  document.getElementById('undo').onclick = () => {
+    const u1 = chess.undo(); if (u1) plyCount--;
+    const u2 = chess.undo(); if (u2) plyCount--;
+    // NOTE: undo does not recompute historical scores; for simplicity we reset scores on undo
+    whiteScore = 0; blackScore = 0; freeHitAwarded = false;
+    // quick rescore by replaying moves
+    const hist = chess.history({ verbose:true });
+    chess.reset(); chess.load(startFENNoCastle);
+    plyCount = 0; lastBlackMove = null;
+    for (const m of hist) {
+      chess.move(m); plyCount++; addMovePoints(m, m.color); if (m.color==='b') lastBlackMove=m;
+    }
+    initBoard();
+  };
+
+  document.getElementById('resetScore').onclick = () => { whiteScore=0; blackScore=0; updateScore(); };
+
+  btnAI.onclick = () => {
+    aiBlackOn = !aiBlackOn;
+    btnAI.textContent = `Play vs AI (Black): ${aiBlackOn ? 'ON' : 'OFF'}`;
+    if (aiBlackOn && chess.turn()==='b' && !(freeHitAwarded && plyCount===12)) setTimeout(aiBlackMove, 200);
+  };
+
+  document.getElementById('loadFEN').onclick = () => {
+    let fen = document.getElementById('fenInput').value.trim();
+    if (!fen) return;
+    // scrub castling/EP fields to '- -' if user forgot
+    const parts = fen.split(/\s+/);
+    if (parts.length >= 4) { parts[2]='-'; parts[3]='-'; fen = parts.join(' '); }
+    try {
+      chess = new Chess(fen);
+      whiteScore = blackScore = 0; plyCount = 0; freeHitAwarded = false; lastBlackMove = null;
+      initBoard();
+    } catch(e) {
+      alert("Invalid FEN.");
+    }
+  };
+
+  // Boot
+  initBoard();
+  </script>
+</body>
+</html>
